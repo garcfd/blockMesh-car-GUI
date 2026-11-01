@@ -1933,6 +1933,279 @@ def _reapply_normal_edges():
         return {"ok": False, "error": repr(e)}
 
 
+_LAYER_LOC = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+              (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+_LAYER_NB = [(1, 3, 4), (2, 0, 5), (3, 1, 6), (0, 2, 7),
+             (7, 5, 0), (4, 6, 1), (5, 7, 2), (6, 4, 3)]      # right-handed corner triples
+_LAYER_FACE_LOCS = [(0, 4, 7, 3), (1, 2, 6, 5), (0, 1, 5, 4),
+                    (3, 7, 6, 2), (0, 3, 2, 1), (4, 5, 6, 7)]
+
+
+def _build_layers_from_dict():
+    """Boundary layers by extrusion of the wall faces, built from the FINISHED
+    system/blockMeshDict (so it contains every polyLine edge, including the ones added
+    after the generator ran). Writes system/blockMeshDict.layers + layers_report.json.
+    Settings: splits.json "layers": {"n", "first" [m], "ratio"}; n = 0 -> off.
+    Every wall face (wheels too) gets n graded cells; wall vertices that also sit on
+    another boundary (ground contact line of the tyres) keep zero thickness and the
+    layer fades in over 2 blocks (collapsed hexes become prisms)."""
+    import collections
+    import numpy as np
+    try:
+        with open(os.path.join(SYS, "splits.json")) as _f:
+            cfg = json.load(_f).get("layers")
+    except (OSError, ValueError, AttributeError):
+        cfg = None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        N = int(float(cfg.get("n", 0) or 0))
+        t0 = float(cfg.get("first", 0.002))
+        rr = float(cfg.get("ratio", 1.2))
+        taper = max(1, int(cfg.get("taper", 2)))
+    except (TypeError, ValueError):
+        return {"ok": False, "n": 0, "log": "layers: bad settings in splits.json"}
+    if N <= 0:
+        return {"ok": True, "n": 0, "log": ""}
+    t0, rr = max(t0, 1e-9), max(rr, 1.0)
+    T_total = t0 * N if abs(rr - 1.0) < 1e-9 else t0 * (rr ** N - 1.0) / (rr - 1.0)
+    z_grade = rr ** (N - 1)
+
+    # ------------------------------------------------------------ read the dict
+    try:
+        with open(os.path.join(SYS, "blockMeshDict")) as _f:
+            txt = _f.read()
+    except OSError as e:
+        return {"ok": False, "n": N, "log": f"layers: cannot read blockMeshDict ({e})"}
+    macros = {m.group(1): float(m.group(2)) for m in re.finditer(
+        r"(?m)^g(xmin|xmax|ymin|ymax|zmin|zmax)\s+([-+.\deE]+);", txt)}
+    mv = re.search(r"(?m)^vertices\s*\n\(\s*\n(.*?)^\);", txt, re.S)
+    mb = re.search(r"(?m)^blocks\s*\n\(\s*\n(.*?)^\);", txt, re.S)
+    me = re.search(r"(?m)^edges\s*\n\(\s*\n(.*?)^\);", txt, re.S)
+    mp = re.search(r"(?m)^boundary\s*\n\(", txt)
+    if not (mv and mb and me and mp):
+        return {"ok": False, "n": N, "log": "layers: blockMeshDict sections not found"}
+    Pbase = np.array([[float(c) for c in m.group(1).split()]
+                      for m in re.finditer(r"(?m)^\s*\(([^()]+)\)\s*$", mv.group(1))], dtype=float)
+    nv0 = len(Pbase)
+    blocks = []                          # (ids, (nx,ny,nz), raw tokens, numeric gradings)
+    for m in re.finditer(r"hex\s*\(([^()]+)\)\s*\(\s*(\d+)\s+(\d+)\s+(\d+)\s*\)\s*"
+                         r"simpleGrading\s*\(([^()]+)\)", mb.group(1)):
+        toks = m.group(5).split()
+        if len(toks) != 3:
+            continue
+        num = []
+        for t in toks:
+            num.append(macros.get(t[1:], 1.0) if t.startswith("$") else float(t))
+        blocks.append(([int(v) for v in m.group(1).split()],
+                       (int(m.group(2)), int(m.group(3)), int(m.group(4))), toks, num))
+    edges, extra_edge_lines = [], []
+    for line in me.group(1).splitlines():
+        m = re.match(r"\s*polyLine\s+(\d+)\s+(\d+)\s*\((.*)\)\s*$", line)
+        if m:
+            pts = [np.array([float(c) for c in q.split()])
+                   for q in re.findall(r"\(([^()]+)\)", m.group(3))]
+            edges.append((int(m.group(1)), int(m.group(2)), pts))
+        elif line.strip():
+            extra_edge_lines.append(line)
+    patches = {}
+    for m in re.finditer(r"(\w+)\s*\{\s*type\s+(\w+);\s*faces\s*\((.*?)\);\s*\}", txt[mp.start():], re.S):
+        patches[m.group(1)] = [tuple(int(v) for v in q.split())
+                               for q in re.findall(r"\(([^()]+)\)", m.group(3))]
+    body = patches.get("body", [])
+    if not body or not blocks:
+        return {"ok": False, "n": N, "log": "layers: no body faces / blocks in blockMeshDict"}
+    body_keys = {tuple(sorted(f)) for f in body}
+    other_v = {v for nm, fl in patches.items() if nm != "body" for fa in fl for v in fa}
+
+    info = []
+    for bi, (ids, nc_, _t, _n) in enumerate(blocks):
+        for loc in _LAYER_FACE_LOCS:
+            face = tuple(ids[n] for n in loc)
+            if tuple(sorted(face)) in body_keys:
+                info.append({"b": bi, "loc": loc, "face": face})
+    wallv = {v for f in info for v in f["face"]}
+    unl = set()
+    shrink = collections.defaultdict(lambda: 1.0)
+    halvings = collections.defaultdict(int)
+
+    def jac_ok(ids, Pall):
+        P = Pall[list(ids)]
+        L = max(float(np.max(np.linalg.norm(P - P[0], axis=1))), 1e-12)
+        for c, (n1, n2, n3) in enumerate(_LAYER_NB):
+            e1, e2, e3 = P[n1] - P[c], P[n2] - P[c], P[n3] - P[c]
+            l1, l2, l3 = (float(np.linalg.norm(e)) for e in (e1, e2, e3))
+            if min(l1, l2, l3) < 1e-9 * L:
+                continue                      # collapsed corner (prism): judged by the others
+            if float(np.dot(np.cross(e1, e2), e3)) / (l1 * l2 * l3) < 0.02:
+                return False
+        return True
+
+    def axis_of(p, q):
+        for a in range(3):
+            if _LAYER_LOC[p][a] != _LAYER_LOC[q][a]:
+                return a, _LAYER_LOC[q][a] - _LAYER_LOC[p][a]
+        return 0, 1
+
+    vp, newpos, nrm, Pall, bad_left = {}, [], {}, Pbase, 0
+    for outer in range(60):
+        while True:                                          # border + fade-in closure
+            B = set(other_v & wallv)
+            for i in unl:
+                B.update(info[i]["face"])
+            adj = collections.defaultdict(set)
+            for i, f in enumerate(info):
+                if i in unl:
+                    continue
+                q = f["face"]
+                for m_ in range(4):
+                    adj[q[m_]].add(q[(m_ + 1) % 4])
+                    adj[q[(m_ + 1) % 4]].add(q[m_])
+            dist = {v: 0 for v in B}
+            dq = collections.deque(B)
+            while dq:
+                v = dq.popleft()
+                for w in adj.get(v, ()):
+                    if w not in dist:
+                        dist[w] = dist[v] + 1
+                        dq.append(w)
+            sval = (lambda v, _d=dist: 1.0 if _d.get(v) is None else min(1.0, _d[v] / float(taper)))
+            changed = False
+            for i, f in enumerate(info):
+                if i in unl:
+                    continue
+                z_ = [sval(v) == 0.0 for v in f["face"]]
+                c = sum(z_)
+                if c >= 3 or (c == 2 and ((z_[0] and z_[2]) or (z_[1] and z_[3]))):
+                    unl.add(i)
+                    changed = True
+            if not changed:
+                break
+        nrm = {}                                             # normals into the fluid
+        for i, f in enumerate(info):
+            if i in unl:
+                continue
+            P = Pbase[list(f["face"])]
+            nf = 0.5 * np.cross(P[2] - P[0], P[3] - P[1])    # points out of the fluid
+            for v in f["face"]:
+                nrm[v] = nrm.get(v, np.zeros(3)) - nf
+        for v in list(nrm):
+            Ln = float(np.linalg.norm(nrm[v]))
+            nrm[v] = nrm[v] / Ln if Ln > 1e-30 else np.zeros(3)
+        vp, newpos = {}, []
+        for v in sorted(nrm):
+            Tv = T_total * sval(v) * shrink[v]
+            if Tv > 1e-12 and float(np.linalg.norm(nrm[v])) > 0:
+                vp[v] = nv0 + len(newpos)
+                newpos.append(Pbase[v] + Tv * nrm[v])
+        Pall = np.vstack([Pbase, np.asarray(newpos, dtype=float).reshape(-1, 3)])
+        bad_v = set()
+        for i, f in enumerate(info):
+            if i in unl:
+                continue
+            q = f["face"]
+            top = [vp.get(v, v) for v in q]
+            if not jac_ok([q[0], q[3], q[2], q[1], top[0], top[3], top[2], top[1]], Pall):
+                bad_v.update(v for v in q if v in vp)
+        for ids, _nc, _t, _n in blocks:
+            if any(v in vp for v in ids) and not jac_ok([vp.get(v, v) for v in ids], Pall):
+                bad_v.update(v for v in ids if v in vp)
+        bad_left = len(bad_v)
+        if not bad_v:
+            break
+        for v in bad_v:
+            shrink[v] *= 0.5
+            halvings[v] += 1
+            if halvings[v] >= 6:                             # cannot be made valid: leave it alone
+                for i, f in enumerate(info):
+                    if v in f["face"]:
+                        unl.add(i)
+                shrink[v] = 1.0
+                halvings[v] = 0
+
+    # ------------------------------------------------------------ edges
+    T_of = {v: float(np.linalg.norm(Pall[vp[v]] - Pbase[v])) if v in vp else 0.0 for v in nrm}
+    edges2 = []
+    for a, b, pts in edges:
+        a2, b2 = vp.get(a, a), vp.get(b, b)
+        if a2 == a and b2 == b:
+            edges2.append((a, b, pts))
+            continue
+        if a in nrm and b in nrm:
+            edges2.append((a, b, pts))                       # surface edge: bottom of the layer blocks
+            seq = [Pbase[a]] + list(pts) + [Pbase[b]]
+            seg = [float(np.linalg.norm(seq[m_ + 1] - seq[m_])) for m_ in range(len(seq) - 1)]
+            tot = sum(seg) or 1.0
+            cum, off = 0.0, []
+            for m_, q in enumerate(pts):
+                cum += seg[m_]
+                u = cum / tot
+                n_ = (1 - u) * nrm[a] + u * nrm[b]
+                Ln = float(np.linalg.norm(n_))
+                n_ = n_ / Ln if Ln > 0 else n_
+                off.append(q + ((1 - u) * T_of[a] + u * T_of[b]) * n_)
+            edges2.append((a2, b2, off))
+        else:
+            edges2.append((a2, b2, pts))
+
+    # ------------------------------------------------------------ write
+    out_path = os.path.join(SYS, "blockMeshDict.layers")
+    out = [txt[:mv.start()].rstrip("\n") + "\n",
+           "// LAYERS: %s\n\n" % json.dumps({"n": N, "first": t0, "ratio": rr,
+                                             "total_thickness": T_total}),
+           "vertices\n(\n"]
+    for p in Pall:
+        out.append("    (%.8g %.8g %.8g)\n" % tuple(p))
+    out.append(");\n\nblocks\n(\n")
+    for ids, nc_, toks, _n in blocks:
+        out.append("    hex (%s) (%d %d %d) simpleGrading (%s %s %s)\n"
+                   % (" ".join(str(vp.get(v, v)) for v in ids), nc_[0], nc_[1], nc_[2],
+                      toks[0], toks[1], toks[2]))
+    n_layer = 0
+    for i, fc in enumerate(info):
+        if i in unl:
+            continue
+        q, loc, bi = fc["face"], fc["loc"], fc["b"]
+        top = [vp.get(v, v) for v in q]
+        ids = [q[0], q[3], q[2], q[1], top[0], top[3], top[2], top[1]]
+        a1, s1 = axis_of(loc[0], loc[3])
+        a2_, s2 = axis_of(loc[0], loc[1])
+        G, ncb = blocks[bi][3], blocks[bi][1]
+        g1 = G[a1] if s1 > 0 else 1.0 / G[a1]
+        g2 = G[a2_] if s2 > 0 else 1.0 / G[a2_]
+        out.append("    hex (%s) (%d %d %d) simpleGrading (%.6g %.6g %.6g)\n"
+                   % (" ".join(map(str, ids)), ncb[a1], ncb[a2_], N, g1, g2, z_grade))
+        n_layer += 1
+    out.append(");\n\nedges\n(\n")
+    for a, b, pts in edges2:
+        out.append("    polyLine %d %d (%s)\n" % (a, b, "".join("(%.8g %.8g %.8g)" % tuple(q) for q in pts)))
+    for line in extra_edge_lines:
+        out.append(line + "\n")
+    out.append(");\n\n")
+    out.append(txt[mp.start():])
+    try:
+        with open(out_path, "w") as f:
+            f.write("".join(out))
+    except OSError as e:
+        return {"ok": False, "n": N, "log": f"layers: cannot write {out_path} ({e})"}
+
+    rep = {"n": N, "first": t0, "ratio": rr, "total_thickness_m": T_total,
+           "wall_faces": len(info), "layered_faces": n_layer, "dropped_for_quality": len(unl),
+           "offset_vertices": len(newpos), "polyline_edges_in": len(edges),
+           "polyline_edges_out": len(edges2),
+           "thinned_vertices": int(sum(1 for v in nrm if shrink[v] < 1.0)),
+           "invalid_blocks_left": bad_left}
+    try:
+        with open(os.path.join(SYS, "layers_report.json"), "w") as rf:
+            json.dump(rep, rf, indent=2)
+    except OSError:
+        pass
+    msg = (f"layers: {N} x (first {t0*1000:g} mm, ratio {rr:g}) = {T_total*1000:.1f} mm; "
+           f"{n_layer}/{len(info)} wall faces layered ({len(unl)} dropped for quality), "
+           f"{len(newpos)} offset vertices, {len(edges)} polyLine edges carried "
+           f"({len(edges2)} written), {rep['thinned_vertices']} thinned, {bad_left} invalid left")
+    return {"ok": True, "n": N, "log": msg, "report": rep}
+
+
 def _normal_curve(p0, p1, n, k=6):
     """Cubic Bezier from surface vertex p0 to p1 that leaves p0 along the surface
     normal n and arrives along the straight direction. None if the edge runs
@@ -2019,7 +2292,7 @@ def _straight_edge_set():
         return set()
 
 
-def _refresh_interface_edges(changed=None, missing_only=False, include_straight=False):
+def _refresh_interface_edges(changed=None, missing_only=False, include_straight=True):
     """Make EVERY interface edge (edge of a body/wheels wall quad) a polyLine whose
     points lie on the car surface, so no interface edge is left straight.
 
@@ -2574,6 +2847,12 @@ class H(BaseHTTPRequestHandler):
                         "error": snap["error"], "cancelled": snap["cancelled"],
                         "result": snap["result"] if not snap["running"] else None})
         elif u.path == "/api/read_dict":
+            def _read_layers():
+                try:
+                    _l = json.load(open(os.path.join(SYS, "splits.json"))).get("layers")
+                    return _l if isinstance(_l, dict) else {}
+                except (OSError, ValueError):
+                    return {}
             # Splits that produced system/blockMeshDict: preferred source is
             # the SPLITS comment stamped by the generator; fallback is
             # system/splits.json (written by the GUI on every export).
@@ -2600,6 +2879,7 @@ class H(BaseHTTPRequestHandler):
                                        "fluid": _fluid if isinstance(_fluid, list) else [],
                             "grade_overrides": (_sd.get("grade_overrides")
                                                 if isinstance(_sd.get("grade_overrides"), dict) else {}),
+                                       "layers": _read_layers(),
                                        "source": "blockMeshDict"})
                 with open(os.path.join(SYS, "splits.json")) as f:
                     d = json.load(f)
@@ -2611,6 +2891,7 @@ class H(BaseHTTPRequestHandler):
                                    "fluid": d.get("fluid", []) if isinstance(d.get("fluid"), list) else [],
                                    "grade_overrides": (d.get("grade_overrides")
                                                        if isinstance(d.get("grade_overrides"), dict) else {}),
+                                   "layers": _read_layers(),
                                    "source": "splits.json"})
             except (OSError, ValueError, KeyError, TypeError) as e:
                 return self._json({"error": f"no readable splits: {e}"}, 404)
@@ -2769,6 +3050,10 @@ class H(BaseHTTPRequestHandler):
                 payload["symmetry"] = _old["symmetry"]
             if "symmetry" in data:
                 payload["symmetry"] = data["symmetry"]
+            if isinstance(_old.get("layers"), dict):      # boundary-layer settings survive Write
+                payload["layers"] = _old["layers"]
+            if isinstance(data.get("layers"), dict):
+                payload["layers"] = data["layers"]
             if "pins_exact" in _old:
                 payload["pins_exact"] = _old["pins_exact"]
             if "pins_exact" in data:
@@ -2804,8 +3089,12 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "log": tail})
             out = {"ok": True, "log": tail, "grading": _grading_report()}
             # whatever the generator left straight on the interface is curved now
-            out["interface_edges"] = _refresh_interface_edges(None, missing_only=True)
+            # Write projects EVERY wall edge (as Update projection does), including the
+            # strongly curved ones (leading edge) the generator's deviation filter left straight.
+            out["interface_edges"] = _refresh_interface_edges(None, missing_only=True, include_straight=True)
             out["normal_edges"] = _reapply_normal_edges()
+            # layers are built from the FINISHED dict, so they carry every curved edge
+            out["layers"] = _build_layers_from_dict()
             if data.get("runMesh"):
                 _, mlog = run(["bash", "-lc",
                                "source /opt/openfoam12/etc/bashrc; "
@@ -2823,10 +3112,19 @@ class H(BaseHTTPRequestHandler):
             # Run blockMesh only (same invocation as checkMesh / export runMesh).
             import traceback as _tb
             try:
+                _bm = "blockMesh"
+                if data.get("layers"):
+                    # rebuild from the CURRENT blockMeshDict, so Update projection / pins /
+                    # edge changes made since the last Write are included
+                    _lr = _build_layers_from_dict()
+                    if not _lr.get("ok") or not _lr.get("n"):
+                        return self._json({"ok": False, "log": _lr.get("log")
+                                           or "layers are off: set 'layers' > 0 in BOUNDARY LAYERS"})
+                    _bm = "blockMesh -dict system/blockMeshDict.layers"
                 code, log = run(["bash", "-lc",
                                  "source /opt/openfoam12/etc/bashrc; "
                                  f"cd {CASE}; rm -rf constant/polyMesh; "
-                                 "blockMesh 2>&1"], timeout=900)
+                                 f"{_bm} 2>&1"], timeout=900)
                 ok = (code == 0) and ("FOAM FATAL" not in log) \
                     and ("FOAM exiting" not in log)
                 return self._json({"ok": ok,
@@ -3051,7 +3349,7 @@ class H(BaseHTTPRequestHandler):
             _backup_dict()
             return self._json(_refresh_interface_edges(
                 None, missing_only=bool(data.get("missing_only", True)),
-            include_straight=bool(data.get("include_straight", False))))
+            include_straight=bool(data.get("include_straight", True))))
         if u.path == "/api/snap":
             # Nearest point on a surface: target "stl" (car STL) or "smooth"
             # (smooth distance-field mesh). {points:[[x,y,z],...], target}

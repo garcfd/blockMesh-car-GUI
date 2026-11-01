@@ -181,6 +181,14 @@
   <div class="btnrow"><button class="btn" id="updproj">Update projection</button><button class="btn ghost" id="undopbtn">Undo projection</button></div>
   <div class="btnrow"><button class="btn ghost" id="sympbtn" title="average (x,y,|z|) of each z+/z- vertex pair">Symmetry (average)</button><button class="btn ghost" id="symcopybtn" title="copy every z+ vertex onto its z- mirror">Symmetry (z+ to z-)</button><button class="btn ghost" id="symprevbtn" style="display:none">CANCEL</button></div>
   </div>
+  <h2 id="lyrhead" style="cursor:pointer;user-select:none">BOUNDARY LAYERS &#9656;</h2>
+  <div id="lyrwrap" style="display:none">
+  <div class="btnrow" style="align-items:center"><span class="mut" style="width:104px">layers</span><input type="number" id="lyrn" min="0" max="30" step="1" value="0" style="width:78px"><span class="mut">0 = off</span></div>
+  <div class="btnrow" style="align-items:center"><span class="mut" style="width:104px">first cell</span><input type="number" id="lyrfirst" min="0.01" step="0.1" value="2" style="width:78px"><span class="mut">mm</span></div>
+  <div class="btnrow" style="align-items:center"><span class="mut" style="width:104px">growth ratio</span><input type="number" id="lyrratio" min="1" max="2" step="0.05" value="1.2" style="width:78px"></div>
+  <label class="chk"><input type="checkbox" id="lyrmesh"> Run blockMesh on the layers dict</label>
+  <div id="lyrinfo" class="mut" style="white-space:pre-line"></div>
+  </div>
   <div class="btnrow"><button class="btn" id="expbtn">Write blockMeshDict</button></div>
   <div class="btnrow"><button class="btn" id="runbmbtn">Run blockMesh</button></div>
   <div class="btnrow"><button class="btn" id="chkmeshbtn">Run checkMesh</button></div>
@@ -1635,10 +1643,12 @@ $("expbtn").onclick=async()=>{
     const body={x:S.splits.x, y:S.splits.y, z:S.splits.z, solid:so, fluid:fl};
     if(S.pins) body.pins=S.pins;
     if(S.gradeOverrides && Object.keys(S.gradeOverrides).length) body.grade_overrides=S.gradeOverrides;
+    body.layers=layersCfg();
     const r=await api("/api/export",{method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
     if(r.ok===false) throw new Error(tailMsg(r.log,2)||"exporter failed");
-    setStat("blockMeshDict written"); log(r.log||"blockMeshDict written");
+    setStat(body.layers.n>0?"blockMeshDict + layers dict written":"blockMeshDict written"); log(r.log||"blockMeshDict written");
+    if(r.layers && r.layers.log) log(r.layers.log);
     await loadDictSurface();            // the dict was regenerated: re-read wall + curves
     await refreshBlocks();
     refreshSelHL();
@@ -1655,7 +1665,7 @@ $("runbmbtn").onclick=async()=>{
   setStat("blockMesh running…");
   try{
     const r=await api("/api/blockMesh",{method:"POST",
-      headers:{"Content-Type":"application/json"}, body:"{}"});
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({layers:$("lyrmesh").checked})});
     if(!r.ok) throw new Error(tailMsg(r.log,2)||"blockMesh failed");
     setStat("blockMesh OK"); log(r.log||"blockMesh OK");
     await refreshBlocks();
@@ -1819,6 +1829,31 @@ $("vishead").onclick=()=>{
   const w=$("viswrap"), open=w.style.display!=="none";
   w.style.display=open?"none":"";
   $("vishead").innerHTML=open?"VISIBILITY &#9656;":"VISIBILITY &#9662;";
+};
+function layersCfg(){
+  const num=(id,d)=>{ const v=parseFloat($(id).value); return Number.isFinite(v)?v:d; };
+  return {n:Math.max(0,Math.round(num("lyrn",0))), first:Math.max(1e-5,num("lyrfirst",2))/1000,
+          ratio:Math.max(1,num("lyrratio",1.2))};
+}
+function layersInfo(){
+  const c=layersCfg(), el=$("lyrinfo"); if(!el) return;
+  if(c.n<=0){ el.textContent="layers off"; return; }
+  const T=Math.abs(c.ratio-1)<1e-9 ? c.first*c.n : c.first*(Math.pow(c.ratio,c.n)-1)/(c.ratio-1);
+  el.textContent=`total thickness ${(T*1000).toFixed(1)} mm, last cell ${(c.first*Math.pow(c.ratio,c.n-1)*1000).toFixed(1)} mm\nPress "Write blockMeshDict" to build system/blockMeshDict.layers`;
+}
+function applyLayersUI(c){
+  if(!c||typeof c!=="object") { layersInfo(); return; }
+  if(Number.isFinite(c.n)) $("lyrn").value=c.n;
+  if(Number.isFinite(c.first)) $("lyrfirst").value=+(c.first*1000).toFixed(4);
+  if(Number.isFinite(c.ratio)) $("lyrratio").value=c.ratio;
+  layersInfo();
+}
+for(const id of ["lyrn","lyrfirst","lyrratio"]) $(id).addEventListener("input",layersInfo);
+layersInfo();
+$("lyrhead").onclick=()=>{
+  const w=$("lyrwrap"), open=w.style.display!=="none";
+  w.style.display=open?"none":"";
+  $("lyrhead").innerHTML=open?"BOUNDARY LAYERS &#9656;":"BOUNDARY LAYERS &#9662;";
 };
 $("projhead").onclick=()=>{
   const w=$("projwrap"), open=w.style.display!=="none";
@@ -2804,11 +2839,12 @@ async function fixStraightInterfaceEdges(){
 }
 async function loadDictSurface(){
   try{
-    const w = await api("/api/dictwall");
+    const w = await api("/api/dictwall?check=1");      // check=1: also find edges still off the surface (amber)
     S.dictVerts = w.verts || [];
     S.dictGrid = {x:w.x||[], y:w.y||[], z:w.z||[]};
     S.faceProj = {faceIndices:w.fidx||[], curves:w.curves||[],
-                  curveIds:w.curveIds||[], bands:[]};
+                  curveIds:w.curveIds||[], bands:[],
+                  unproj:Array.isArray(w.unprojected)?w.unprojected:null};
     S.nStraight = w.n_straight||0;
     _surfIds=null;
     return true;
@@ -2855,6 +2891,7 @@ $("sldcbtn").onclick=()=>setVertexTool("slide");
       for(const t of (savedGrid.fluid||[])) if(Array.isArray(t)&&t.length===3) S.over[t.join(",")]=0;
       if(savedGrid.pins && typeof savedGrid.pins==="object") S.pins = savedGrid.pins;
     if(savedGrid.grade_overrides && typeof savedGrid.grade_overrides==="object") S.gradeOverrides = savedGrid.grade_overrides;
+    applyLayersUI(savedGrid.layers);
     } else {
       S.splits = tables.tuned || S.splits;
     }
