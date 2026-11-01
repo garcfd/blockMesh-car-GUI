@@ -1930,3 +1930,4 @@ convertToMeters 1;
         f.write("        );\n    }\n")
     f.write(");\n\nmergePatchPairs\n(\n);\n")
 print(f"wrote {OUT}", file=sys.stderr)
+# Boundary layers are built by the GUI server from the finished blockMeshDict (server.py).
