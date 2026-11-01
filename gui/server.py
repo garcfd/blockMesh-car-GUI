@@ -1939,16 +1939,21 @@ _LAYER_NB = [(1, 3, 4), (2, 0, 5), (3, 1, 6), (0, 2, 7),
              (7, 5, 0), (4, 6, 1), (5, 7, 2), (6, 4, 3)]      # right-handed corner triples
 _LAYER_FACE_LOCS = [(0, 4, 7, 3), (1, 2, 6, 5), (0, 1, 5, 4),
                     (3, 7, 6, 2), (0, 3, 2, 1), (4, 5, 6, 7)]
+_LAYER_HEX_FACES = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+                    (3, 7, 6, 2), (0, 4, 7, 3), (1, 2, 6, 5)]  # outward-oriented hex faces
 
 
 def _build_layers_from_dict():
-    """Boundary layers by extrusion of the wall faces, built from the FINISHED
-    system/blockMeshDict (so it contains every polyLine edge, including the ones added
-    after the generator ran). Writes system/blockMeshDict.layers + layers_report.json.
+    """Boundary layers by extrusion of ALL wall faces (wheels included), built from the
+    FINISHED system/blockMeshDict (so it carries every polyLine edge, including the ones
+    added after the generator ran). Writes system/blockMeshDict.layers + layers_report.json.
     Settings: splits.json "layers": {"n", "first" [m], "ratio"}; n = 0 -> off.
-    Every wall face (wheels too) gets n graded cells; wall vertices that also sit on
-    another boundary (ground contact line of the tyres) keep zero thickness and the
-    layer fades in over 2 blocks (collapsed hexes become prisms)."""
+
+    The layers run straight into the outer boundaries of the domain (the ground under the
+    tyres) as if they continued through the plane and were cut off at it: a vertex lying on
+    an outer boundary plane is only offset WITHIN that plane, every other offset is clipped
+    to the domain box, and the layer-block faces that end up on a boundary plane are added to
+    that boundary's patch. There is no tapering and nothing is omitted."""
     import collections
     import numpy as np
     try:
@@ -1961,12 +1966,12 @@ def _build_layers_from_dict():
         N = int(float(cfg.get("n", 0) or 0))
         t0 = float(cfg.get("first", 0.002))
         rr = float(cfg.get("ratio", 1.2))
-        taper = max(1, int(cfg.get("taper", 2)))
     except (TypeError, ValueError):
         return {"ok": False, "n": 0, "log": "layers: bad settings in splits.json"}
     if N <= 0:
         return {"ok": True, "n": 0, "log": ""}
     t0, rr = max(t0, 1e-9), max(rr, 1.0)
+    taper = 2            # only used if a face has to be dropped because it cannot be made valid
     T_total = t0 * N if abs(rr - 1.0) < 1e-9 else t0 * (rr ** N - 1.0) / (rr - 1.0)
     z_grade = rr ** (N - 1)
 
@@ -1993,9 +1998,7 @@ def _build_layers_from_dict():
         toks = m.group(5).split()
         if len(toks) != 3:
             continue
-        num = []
-        for t in toks:
-            num.append(macros.get(t[1:], 1.0) if t.startswith("$") else float(t))
+        num = [macros.get(t[1:], 1.0) if t.startswith("$") else float(t) for t in toks]
         blocks.append(([int(v) for v in m.group(1).split()],
                        (int(m.group(2)), int(m.group(3)), int(m.group(4))), toks, num))
     edges, extra_edge_lines = [], []
@@ -2007,15 +2010,30 @@ def _build_layers_from_dict():
             edges.append((int(m.group(1)), int(m.group(2)), pts))
         elif line.strip():
             extra_edge_lines.append(line)
-    patches = {}
+    patches = {}                         # name -> [type, [faces]]  (file order kept)
     for m in re.finditer(r"(\w+)\s*\{\s*type\s+(\w+);\s*faces\s*\((.*?)\);\s*\}", txt[mp.start():], re.S):
-        patches[m.group(1)] = [tuple(int(v) for v in q.split())
-                               for q in re.findall(r"\(([^()]+)\)", m.group(3))]
-    body = patches.get("body", [])
+        patches[m.group(1)] = [m.group(2), [tuple(int(v) for v in q.split())
+                                            for q in re.findall(r"\(([^()]+)\)", m.group(3))]]
+    body = patches.get("body", [None, []])[1]
     if not body or not blocks:
         return {"ok": False, "n": N, "log": "layers: no body faces / blocks in blockMeshDict"}
     body_keys = {tuple(sorted(f)) for f in body}
-    other_v = {v for nm, fl in patches.items() if nm != "body" for fa in fl for v in fa}
+
+    # outer boundary planes of the domain (flat box): vertices on them slide in-plane
+    lo, hi = Pbase.min(axis=0), Pbase.max(axis=0)
+    tol = 1e-6 * float(np.max(hi - lo))
+    on_lo = np.abs(Pbase - lo) < tol
+    on_hi = np.abs(Pbase - hi) < tol
+    plane_patch = {}                     # (axis, 0 lo / 1 hi) -> outer patch name
+    for nm, (_ty, fl) in patches.items():
+        if nm == "body":
+            continue
+        for fa in fl:
+            for a in range(3):
+                if all(on_lo[v][a] for v in fa):
+                    plane_patch.setdefault((a, 0), nm)
+                if all(on_hi[v][a] for v in fa):
+                    plane_patch.setdefault((a, 1), nm)
 
     info = []
     for bi, (ids, nc_, _t, _n) in enumerate(blocks):
@@ -2023,8 +2041,7 @@ def _build_layers_from_dict():
             face = tuple(ids[n] for n in loc)
             if tuple(sorted(face)) in body_keys:
                 info.append({"b": bi, "loc": loc, "face": face})
-    wallv = {v for f in info for v in f["face"]}
-    unl = set()
+    unl = set()                          # faces dropped because they could not be made valid
     shrink = collections.defaultdict(lambda: 1.0)
     halvings = collections.defaultdict(int)
 
@@ -2046,20 +2063,21 @@ def _build_layers_from_dict():
                 return a, _LAYER_LOC[q][a] - _LAYER_LOC[p][a]
         return 0, 1
 
-    vp, newpos, nrm, Pall, bad_left = {}, [], {}, Pbase, 0
+    vp, newpos, nrm, Pall, bad_left, n_slid = {}, [], {}, Pbase, 0, 0
     for outer in range(60):
-        while True:                                          # border + fade-in closure
-            B = set(other_v & wallv)
+        while True:        # dropped faces keep their vertices fixed; the layer fades in next to them
+            B = set()
             for i in unl:
                 B.update(info[i]["face"])
             adj = collections.defaultdict(set)
-            for i, f in enumerate(info):
-                if i in unl:
-                    continue
-                q = f["face"]
-                for m_ in range(4):
-                    adj[q[m_]].add(q[(m_ + 1) % 4])
-                    adj[q[(m_ + 1) % 4]].add(q[m_])
+            if B:
+                for i, f in enumerate(info):
+                    if i in unl:
+                        continue
+                    q = f["face"]
+                    for m_ in range(4):
+                        adj[q[m_]].add(q[(m_ + 1) % 4])
+                        adj[q[(m_ + 1) % 4]].add(q[m_])
             dist = {v: 0 for v in B}
             dq = collections.deque(B)
             while dq:
@@ -2088,15 +2106,22 @@ def _build_layers_from_dict():
             nf = 0.5 * np.cross(P[2] - P[0], P[3] - P[1])    # points out of the fluid
             for v in f["face"]:
                 nrm[v] = nrm.get(v, np.zeros(3)) - nf
+        n_slid = 0
         for v in list(nrm):
-            Ln = float(np.linalg.norm(nrm[v]))
-            nrm[v] = nrm[v] / Ln if Ln > 1e-30 else np.zeros(3)
+            n_ = nrm[v] / max(float(np.linalg.norm(nrm[v])), 1e-30)
+            fixed = on_lo[v] | on_hi[v]                      # on an outer boundary plane: slide in it
+            if fixed.any():
+                n_ = np.where(fixed, 0.0, n_)
+                Ln = float(np.linalg.norm(n_))
+                n_ = n_ / Ln if Ln > 1e-3 else np.zeros(3)
+                n_slid += 1
+            nrm[v] = n_
         vp, newpos = {}, []
         for v in sorted(nrm):
             Tv = T_total * sval(v) * shrink[v]
             if Tv > 1e-12 and float(np.linalg.norm(nrm[v])) > 0:
                 vp[v] = nv0 + len(newpos)
-                newpos.append(Pbase[v] + Tv * nrm[v])
+                newpos.append(np.minimum(np.maximum(Pbase[v] + Tv * nrm[v], lo), hi))   # cut at the box
         Pall = np.vstack([Pbase, np.asarray(newpos, dtype=float).reshape(-1, 3)])
         bad_v = set()
         for i, f in enumerate(info):
@@ -2142,10 +2167,39 @@ def _build_layers_from_dict():
                 n_ = (1 - u) * nrm[a] + u * nrm[b]
                 Ln = float(np.linalg.norm(n_))
                 n_ = n_ / Ln if Ln > 0 else n_
-                off.append(q + ((1 - u) * T_of[a] + u * T_of[b]) * n_)
+                off.append(np.minimum(np.maximum(q + ((1 - u) * T_of[a] + u * T_of[b]) * n_, lo), hi))
             edges2.append((a2, b2, off))
         else:
             edges2.append((a2, b2, pts))
+
+    # ------------------------------------------------------------ boundary patches
+    layer_blocks = []
+    for i, fc in enumerate(info):
+        if i in unl:
+            continue
+        q, loc, bi = fc["face"], fc["loc"], fc["b"]
+        top = [vp.get(v, v) for v in q]
+        ids = [q[0], q[3], q[2], q[1], top[0], top[3], top[2], top[1]]
+        a1, s1 = axis_of(loc[0], loc[3])
+        a2_, s2 = axis_of(loc[0], loc[1])
+        G, ncb = blocks[bi][3], blocks[bi][1]
+        g1 = G[a1] if s1 > 0 else 1.0 / G[a1]
+        g2 = G[a2_] if s2 > 0 else 1.0 / G[a2_]
+        layer_blocks.append((ids, (ncb[a1], ncb[a2_], N), (g1, g2, z_grade)))
+    new_patches = collections.OrderedDict()
+    for nm, (ty, fl) in patches.items():
+        new_patches[nm] = [ty, fl if nm == "body" else [tuple(vp.get(v, v) for v in fa) for fa in fl]]
+    n_cut = 0
+    for ids, _nc, _g in layer_blocks:                        # layer faces that lie ON an outer plane
+        for hf in _LAYER_HEX_FACES:
+            q = [ids[n] for n in hf]
+            if len(set(q)) < 4:
+                continue
+            for (a, side), nm in plane_patch.items():
+                ref = lo[a] if side == 0 else hi[a]
+                if all(abs(Pall[v][a] - ref) < tol for v in q):
+                    new_patches[nm][1].append(tuple(q))
+                    n_cut += 1
 
     # ------------------------------------------------------------ write
     out_path = os.path.join(SYS, "blockMeshDict.layers")
@@ -2160,28 +2214,21 @@ def _build_layers_from_dict():
         out.append("    hex (%s) (%d %d %d) simpleGrading (%s %s %s)\n"
                    % (" ".join(str(vp.get(v, v)) for v in ids), nc_[0], nc_[1], nc_[2],
                       toks[0], toks[1], toks[2]))
-    n_layer = 0
-    for i, fc in enumerate(info):
-        if i in unl:
-            continue
-        q, loc, bi = fc["face"], fc["loc"], fc["b"]
-        top = [vp.get(v, v) for v in q]
-        ids = [q[0], q[3], q[2], q[1], top[0], top[3], top[2], top[1]]
-        a1, s1 = axis_of(loc[0], loc[3])
-        a2_, s2 = axis_of(loc[0], loc[1])
-        G, ncb = blocks[bi][3], blocks[bi][1]
-        g1 = G[a1] if s1 > 0 else 1.0 / G[a1]
-        g2 = G[a2_] if s2 > 0 else 1.0 / G[a2_]
+    for ids, nc_, g_ in layer_blocks:
         out.append("    hex (%s) (%d %d %d) simpleGrading (%.6g %.6g %.6g)\n"
-                   % (" ".join(map(str, ids)), ncb[a1], ncb[a2_], N, g1, g2, z_grade))
-        n_layer += 1
+                   % (" ".join(map(str, ids)), nc_[0], nc_[1], nc_[2], g_[0], g_[1], g_[2]))
     out.append(");\n\nedges\n(\n")
     for a, b, pts in edges2:
         out.append("    polyLine %d %d (%s)\n" % (a, b, "".join("(%.8g %.8g %.8g)" % tuple(q) for q in pts)))
     for line in extra_edge_lines:
         out.append(line + "\n")
-    out.append(");\n\n")
-    out.append(txt[mp.start():])
+    out.append(");\n\nboundary\n(\n")
+    for nm, (ty, fl) in new_patches.items():
+        out.append("    %s\n    {\n        type %s;\n        faces\n        (\n" % (nm, ty))
+        for fa in fl:
+            out.append("            (%s)\n" % " ".join(map(str, fa)))
+        out.append("        );\n    }\n")
+    out.append(");\n\nmergePatchPairs\n(\n);\n")
     try:
         with open(out_path, "w") as f:
             f.write("".join(out))
@@ -2189,9 +2236,10 @@ def _build_layers_from_dict():
         return {"ok": False, "n": N, "log": f"layers: cannot write {out_path} ({e})"}
 
     rep = {"n": N, "first": t0, "ratio": rr, "total_thickness_m": T_total,
-           "wall_faces": len(info), "layered_faces": n_layer, "dropped_for_quality": len(unl),
-           "offset_vertices": len(newpos), "polyline_edges_in": len(edges),
-           "polyline_edges_out": len(edges2),
+           "wall_faces": len(info), "layered_faces": len(layer_blocks),
+           "dropped_for_quality": len(unl), "offset_vertices": len(newpos),
+           "vertices_sliding_on_outer_planes": n_slid, "layer_faces_cut_at_outer_planes": n_cut,
+           "polyline_edges_in": len(edges), "polyline_edges_out": len(edges2),
            "thinned_vertices": int(sum(1 for v in nrm if shrink[v] < 1.0)),
            "invalid_blocks_left": bad_left}
     try:
@@ -2200,9 +2248,10 @@ def _build_layers_from_dict():
     except OSError:
         pass
     msg = (f"layers: {N} x (first {t0*1000:g} mm, ratio {rr:g}) = {T_total*1000:.1f} mm; "
-           f"{n_layer}/{len(info)} wall faces layered ({len(unl)} dropped for quality), "
-           f"{len(newpos)} offset vertices, {len(edges)} polyLine edges carried "
-           f"({len(edges2)} written), {rep['thinned_vertices']} thinned, {bad_left} invalid left")
+           f"{len(layer_blocks)}/{len(info)} wall faces layered ({len(unl)} dropped for quality), "
+           f"{len(newpos)} offset vertices, {n_slid} sliding on outer planes, "
+           f"{n_cut} layer faces cut at outer planes, {len(edges)} polyLine edges carried, "
+           f"{rep['thinned_vertices']} thinned, {bad_left} invalid left")
     return {"ok": True, "n": N, "log": msg, "report": rep}
 
 
