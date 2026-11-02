@@ -1164,8 +1164,8 @@ except (OSError, ValueError, TypeError):
 _wall_vertices = sorted({int(v) for _face in patches["body"] for v in _face})
 _wall_moved = _wall_rejected = 0
 for _v in _wall_vertices:
-    if _v in _frozen_vertices or (_PINS_EXACT and _v in _pin_placed):
-        continue   # frozen, or an exact pin: do not move it again
+    if _v in _frozen_vertices or (_PINS_EXACT and _v in _pin_placed) or _v in _ymin_v:
+        continue   # frozen, an exact pin, or a ground-plane (wheel base) vertex: do not move it again
     _start = snapped[_v].copy()
     _target = np.asarray(SDF.project(_start), dtype=float)
     if np.linalg.norm(_target - _start) <= 0.001:
