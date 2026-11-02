@@ -2395,7 +2395,10 @@ async function updateProjection(){
     for(let n=0;n<ids.length;n++){
       const id=ids[n], i=id%(nx+1), j=Math.floor(id/(nx+1))%(ny+1), k=Math.floor(id/((nx+1)*(ny+1)));
       if(xs[i]===undefined||ys[j]===undefined||zs[k]===undefined) continue;
-      pins[`${xs[i]}|${ys[j]}|${zs[k]}`]=(j===0)?[projected.points[n][0],ys[0],projected.points[n][2]]:projected.points[n];
+      // Wheel-base vertices on the ground plane keep their (x,z): projecting them moves them
+      // up-and-inward on the tyre every time, and forcing y back onto the plane makes the
+      // contact faces shrink with each Update projection. They only stay on y = ymin.
+      pins[`${xs[i]}|${ys[j]}|${zs[k]}`]=(j===0)?[verts[id][0],ys[0],verts[id][2]]:projected.points[n];
     }
     setStat("writing projected vertices to blockMeshDict…");
     const saved=await api("/api/pinpatch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pins, project_all:true})});
@@ -2442,14 +2445,16 @@ async function makeSymmetrical(mode){
   if(S.symPreview){
     if(btn) btn.disabled=true;
     try{
-      const {moves} = S.symPreview;
-      const states=Object.keys(moves).map(vid=>({vid:Number(vid), pos:moves[vid], pinned:false}));
+      const {moves, pinFlag} = S.symPreview;
+      // pinned:false would DELETE the vertex pin, and Write would then rebuild the vertex
+      // without the copy - so a copied vertex keeps/gets a pin when its partner was pinned
+      const states=Object.keys(moves).map(vid=>({vid:Number(vid), pos:moves[vid], pinned:!!(pinFlag&&pinFlag[vid])}));
       const r=await api("/api/setvertices",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({states})});
       if(r&&r.ok===false) throw new Error(r.error||"server refused");
       const g=await api("/api/read_dict");
       if(g&&g.pins&&typeof g.pins==="object") S.pins=g.pins;
       S.projDirty=true;
-      const afterStates=Object.keys(moves).map(vid=>({vid:Number(vid), pos:[...moves[vid]], pinned:false}));
+      const afterStates=Object.keys(moves).map(vid=>({vid:Number(vid), pos:[...moves[vid]], pinned:!!(pinFlag&&pinFlag[vid])}));
       histPush({kind:"vertex", label:(S.symPreview.mode==="copy"?"symmetry (z+ to z-)":"symmetry (average)"), before:S.symPreview.before, after:afterStates, sig:JSON.stringify(S.dictGrid||null)});
       // cleanup preview
       if(S.symPreview && S.symPreview.oldGroup && S.symPreview.oldGroup.parent) S.symPreview.oldGroup.parent.remove(S.symPreview.oldGroup);
@@ -2497,6 +2502,7 @@ async function makeSymmetrical(mode){
     const prevVerts = verts.map(v=>v?[...v]:v);
     const moves={};
     const before=[];
+    const pinFlag={};     // vertices that must be saved as PINS (their pair has a pin)
     for(const [a,b] of pairs){
       // z-negative point copies (x,y) from the z-positive point; z stays as-is
       let pos, neg;
@@ -2507,8 +2513,12 @@ async function makeSymmetrical(mode){
       if(mode==="copy"){
         // copy z+ onto z-: the z+ vertex is the master and does not move
         const tx=pp[0], ty=pp[1], tz=-pp[2];
-        if(Math.abs(pn[0]-tx)>1e-12 || Math.abs(pn[1]-ty)>1e-12 || Math.abs(pn[2]-tz)>1e-12){
+        // also (re)pin a vertex whose z+ partner is pinned but it is not (e.g. a copy saved before
+        // pins were kept), even when the positions already match
+        const needPin=!!(S.pins&&S.pins[pinKey(pos)]&&!S.pins[pinKey(neg)]);
+        if(needPin || Math.abs(pn[0]-tx)>1e-12 || Math.abs(pn[1]-ty)>1e-12 || Math.abs(pn[2]-tz)>1e-12){
           moves[neg]=[tx,ty,tz];
+          pinFlag[neg]=!!(S.pins&&(S.pins[pinKey(pos)]||S.pins[pinKey(neg)]));
           before.push({vid:neg, pos:[pn[0],pn[1],pn[2]], pinned:!!(S.pins&&S.pins[pinKey(neg)])});
         }
         continue;
@@ -2521,6 +2531,7 @@ async function makeSymmetrical(mode){
          Math.abs(pp[2]-za)>1e-12 || Math.abs(pn[2]+za)>1e-12){
         moves[pos]=[xa, ya, za];
         moves[neg]=[xa, ya, -za];
+        pinFlag[pos]=pinFlag[neg]=!!(S.pins&&(S.pins[pinKey(pos)]||S.pins[pinKey(neg)]));
         before.push({vid:pos, pos:[pp[0],pp[1],pp[2]], pinned:!!(S.pins&&S.pins[pinKey(pos)])});
         before.push({vid:neg, pos:[pn[0],pn[1],pn[2]], pinned:!!(S.pins&&S.pins[pinKey(neg)])});
       }
@@ -2529,7 +2540,7 @@ async function makeSymmetrical(mode){
     // preview: mutate in memory + show edges in red
     for(const vid in moves){ const v=Number(vid); if(verts[v]) verts[v]=[...moves[vid]]; }
     S.symPreviewing = true;
-    S.symPreview = {moves, prevVerts, before, mode};
+    S.symPreview = {moves, prevVerts, before, mode, pinFlag};
     refreshSelHL();
     // draw the ORIGINAL (pre-move) edges in green alongside the red new ones
     const _oldGroup = new THREE.Group();

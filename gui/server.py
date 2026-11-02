@@ -2303,10 +2303,12 @@ def _unprojected_edges(verts, fidx, curves, curve_ids, tol=5e-4):
     surface: a polyLine edge is checked at its points, a straight edge along its chord.
     An edge is unprojected when any sample is more than tol (0.5 mm) off the surface."""
     import numpy as np
+    gd = _dict_grid()
     wall = set()
     for q in fidx:
         for a, b in zip(q, q[1:] + q[:1]):
-            if a != b:
+            # edges lying in the ground plane (wheel bases) are flat on purpose, not "unprojected"
+            if a != b and not (gd is not None and _on_ymin(a, gd) and _on_ymin(b, gd)):
                 wall.add((min(a, b), max(a, b)))
     poly = {(min(i[0], i[1]), max(i[0], i[1])): p for i, p in zip(curve_ids, curves)}
     samples, owner = [], []
